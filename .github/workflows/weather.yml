@@ -4,7 +4,7 @@ name: weather
 
 on:
   schedule:
-    - cron: "12 * * * *"      # 매시 12분 (UTC 기준이지만 '매시'라 상관없음)
+    - cron: "1 * * * *"       # 매시 1분 (GitHub 사정으로 몇 분 늦게 돌 수 있음)
   workflow_dispatch:
 
 permissions:
