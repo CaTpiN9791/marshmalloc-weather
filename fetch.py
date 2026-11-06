@@ -1,11 +1,12 @@
-# 기상청 예보를 받아 VRChat 월드가 읽을 weather.json 하나로 정리한다.
-# GitHub Actions 가 1시간마다 돌린다. 인증키는 저장소 Secret 에서 환경 변수로 들어온다.
-#   KMA_KEY        : 기상청 API허브(apihub.kma.go.kr) 인증키. 관측(ASOS)과 예보
-#   DATA_GO_KR_KEY : (선택) 공공데이터포털 일반 인증키. 있으면 예보를 이쪽에서 받는다
-# 받지 못한 부분은 지난번 weather.json 의 값을 쓴다 (PREV_URL).
+# VRChat 월드 Marshmalloc 의 날씨판이 읽는 weather.json 을 만든다. GitHub Actions 가 1시간마다 돌린다.
+#  - 국내 도시: 기상청 단기·중기예보 (활용신청 승인 전이거나 실패하면 Open-Meteo 로 채움)
+#  - 해외 도시: Open-Meteo (키 필요 없음)
+#  - 날씨판은 방문자 위치(IP)·시간대에서 가장 가까운 도시를 고른다
+# 환경 변수
+#   KMA_KEY        : 기상청 API허브(apihub.kma.go.kr) 인증키
+#   DATA_GO_KR_KEY : (선택) 공공데이터포털 일반 인증키. 있으면 기상청 예보를 이쪽에서 받는다
 import datetime as dt
 import json
-import math
 import os
 import sys
 
@@ -14,22 +15,57 @@ import requests
 KST = dt.timezone(dt.timedelta(hours=9))
 APIHUB = "https://apihub.kma.go.kr/api/"
 DATAGO = "https://apis.data.go.kr/1360000/"
+DAYS = 8   # 자정을 넘겨도 7칸이 남도록 하루 더
 
-# 이름, 격자 nx, ny, 중기 육상 구역, 중기 기온 지점, ASOS 지점
-CITIES = [
-    ("서울", 60, 127, "11B00000", "11B10101", 108),
-    ("인천", 55, 124, "11B00000", "11B20201", 112),
-    ("강릉", 92, 131, "11D20000", "11D20501", 105),
-    ("대전", 67, 100, "11C20000", "11C20401", 133),
-    ("대구", 89, 90, "11H10000", "11H10701", 143),
-    ("광주", 58, 74, "11F20000", "11F20501", 156),
-    ("부산", 98, 76, "11H20000", "11H20201", 159),
-    ("제주", 52, 38, "11G00000", "11G00201", 184),
+# 국내: 이름, 영문, 위도, 경도, 격자 nx, ny, 중기 육상 구역, 중기 기온 지점
+KR = [
+    ("서울", "Seoul", 37.566, 126.978, 60, 127, "11B00000", "11B10101"),
+    ("인천", "Incheon", 37.456, 126.705, 55, 124, "11B00000", "11B20201"),
+    ("수원", "Suwon", 37.263, 127.029, 60, 121, "11B00000", "11B20601"),
+    ("춘천", "Chuncheon", 37.881, 127.730, 73, 134, "11D10000", "11D10301"),
+    ("강릉", "Gangneung", 37.752, 128.876, 92, 131, "11D20000", "11D20501"),
+    ("청주", "Cheongju", 36.642, 127.489, 69, 106, "11C10000", "11C10301"),
+    ("대전", "Daejeon", 36.351, 127.385, 67, 100, "11C20000", "11C20401"),
+    ("전주", "Jeonju", 35.825, 127.148, 63, 89, "11F10000", "11F10201"),
+    ("광주", "Gwangju", 35.160, 126.851, 58, 74, "11F20000", "11F20501"),
+    ("대구", "Daegu", 35.871, 128.601, 89, 90, "11H10000", "11H10701"),
+    ("울산", "Ulsan", 35.538, 129.311, 102, 84, "11H20000", "11H20101"),
+    ("부산", "Busan", 35.180, 129.075, 98, 76, "11H20000", "11H20201"),
+    ("제주", "Jeju", 33.500, 126.531, 52, 38, "11G00000", "11G00201"),
 ]
-WEEK = "월화수목금토일"
-SKY_TEXT = {1: "맑음", 3: "구름많음", 4: "흐림"}
-PTY_TEXT = {1: "비", 2: "비/눈", 3: "눈", 4: "소나기", 5: "빗방울", 6: "빗방울눈날림", 7: "눈날림"}
+
+# 해외: 이름, 영문, 위도, 경도, 나라 (시간대가 같은 곳은 앞쪽이 시간대만 알 때의 기본값)
+WORLD = [
+    ("도쿄", "Tokyo", 35.68, 139.69, "JP"), ("오사카", "Osaka", 34.69, 135.50, "JP"),
+    ("삿포로", "Sapporo", 43.06, 141.35, "JP"), ("후쿠오카", "Fukuoka", 33.59, 130.40, "JP"),
+    ("타이베이", "Taipei", 25.03, 121.57, "TW"), ("상하이", "Shanghai", 31.23, 121.47, "CN"),
+    ("베이징", "Beijing", 39.90, 116.41, "CN"), ("홍콩", "Hong Kong", 22.32, 114.17, "HK"),
+    ("마닐라", "Manila", 14.60, 120.98, "PH"), ("싱가포르", "Singapore", 1.35, 103.82, "SG"),
+    ("쿠알라룸푸르", "Kuala Lumpur", 3.14, 101.69, "MY"), ("방콕", "Bangkok", 13.76, 100.50, "TH"),
+    ("하노이", "Hanoi", 21.03, 105.85, "VN"), ("호찌민", "Ho Chi Minh City", 10.82, 106.63, "VN"),
+    ("자카르타", "Jakarta", -6.21, 106.85, "ID"), ("델리", "Delhi", 28.61, 77.21, "IN"),
+    ("뭄바이", "Mumbai", 19.08, 72.88, "IN"), ("두바이", "Dubai", 25.20, 55.27, "AE"),
+    ("이스탄불", "Istanbul", 41.01, 28.98, "TR"), ("모스크바", "Moscow", 55.76, 37.62, "RU"),
+    ("런던", "London", 51.51, -0.13, "GB"), ("파리", "Paris", 48.86, 2.35, "FR"),
+    ("베를린", "Berlin", 52.52, 13.40, "DE"), ("암스테르담", "Amsterdam", 52.37, 4.90, "NL"),
+    ("마드리드", "Madrid", 40.42, -3.70, "ES"), ("로마", "Rome", 41.90, 12.50, "IT"),
+    ("스톡홀름", "Stockholm", 59.33, 18.07, "SE"), ("바르샤바", "Warsaw", 52.23, 21.01, "PL"),
+    ("헬싱키", "Helsinki", 60.17, 24.94, "FI"), ("카이로", "Cairo", 30.04, 31.24, "EG"),
+    ("요하네스버그", "Johannesburg", -26.20, 28.05, "ZA"), ("시드니", "Sydney", -33.87, 151.21, "AU"),
+    ("멜버른", "Melbourne", -37.81, 144.96, "AU"), ("브리즈번", "Brisbane", -27.47, 153.03, "AU"),
+    ("퍼스", "Perth", -31.95, 115.86, "AU"), ("오클랜드", "Auckland", -36.85, 174.76, "NZ"),
+    ("뉴욕", "New York", 40.71, -74.01, "US"), ("토론토", "Toronto", 43.65, -79.38, "CA"),
+    ("시카고", "Chicago", 41.88, -87.63, "US"), ("댈러스", "Dallas", 32.78, -96.80, "US"),
+    ("덴버", "Denver", 39.74, -104.99, "US"), ("로스앤젤레스", "Los Angeles", 34.05, -118.24, "US"),
+    ("샌프란시스코", "San Francisco", 37.77, -122.42, "US"), ("시애틀", "Seattle", 47.61, -122.33, "US"),
+    ("밴쿠버", "Vancouver", 49.28, -123.12, "CA"), ("앵커리지", "Anchorage", 61.22, -149.90, "US"),
+    ("호놀룰루", "Honolulu", 21.31, -157.86, "US"), ("멕시코시티", "Mexico City", 19.43, -99.13, "MX"),
+    ("상파울루", "São Paulo", -23.55, -46.63, "BR"), ("부에노스아이레스", "Buenos Aires", -34.60, -58.38, "AR"),
+    ("산티아고", "Santiago", -33.45, -70.67, "CL"), ("리마", "Lima", -12.05, -77.04, "PE"),
+]
+
 PTY_ICON = {1: "rain", 2: "sleet", 3: "snow", 4: "shower", 5: "rain", 6: "sleet", 7: "snow"}
+MON_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 log = []
 
@@ -39,66 +75,124 @@ def note(s):
     print(s, file=sys.stderr)
 
 
-def get(url, key_name, key, enc="utf-8"):
+def num(v):
     try:
-        r = requests.get(url + ("&" if "?" in url else "?") + key_name + "=" + key, timeout=25)
-        r.encoding = enc
-        if r.status_code != 200:
-            note(f"{url.split('?')[0].rsplit('/', 1)[-1]}: HTTP {r.status_code}")
-            return None
-        return r.text
-    except Exception as e:
-        note(f"{url.split('?')[0].rsplit('/', 1)[-1]}: {e}")
+        return float(v)
+    except (TypeError, ValueError):
         return None
 
 
-def items(text):
-    if not text:
-        return None
-    try:
-        j = json.loads(text)
-        res = j["response"]
-        code = res["header"]["resultCode"]
-        if code != "00":
-            note("예보 응답 " + code + " " + res["header"].get("resultMsg", ""))
-            return None
-        it = res["body"]["items"]["item"]
-        return it if isinstance(it, list) else [it]
-    except Exception as e:
-        note(f"예보 해석 실패: {e}")
-        return None
+def r1(v):
+    return None if v is None else round(v, 1)
 
 
-class Source:
+# ── Open-Meteo ─────────────────────────────────────────
+def wmo_icon(code):
+    c = int(code or 0)
+    if c <= 1:
+        return "sun"
+    if c == 2:
+        return "partly"
+    if c in (3, 45, 48):
+        return "cloud"
+    if c in (66, 67, 56, 57):
+        return "sleet"
+    if 71 <= c <= 77 or c in (85, 86):
+        return "snow"
+    if 80 <= c <= 82 or c >= 95:
+        return "shower"
+    return "rain"
+
+
+def open_meteo(points):
+    """points: [(lat, lon)] → [(tz 분, [day...])] (실패하면 None)"""
+    out = []
+    for i in range(0, len(points), 50):
+        chunk = points[i:i + 50]
+        url = ("https://api.open-meteo.com/v1/forecast?"
+               f"latitude={','.join(str(p[0]) for p in chunk)}&longitude={','.join(str(p[1]) for p in chunk)}"
+               "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               f"&timezone=auto&forecast_days={DAYS}")
+        try:
+            r = requests.get(url, timeout=40)
+            r.raise_for_status()
+            j = r.json()
+            j = j if isinstance(j, list) else [j]
+        except Exception as e:
+            note(f"open-meteo: {e}")
+            out += [None] * len(chunk)
+            continue
+        for x in j:
+            d = x["daily"]
+            days = []
+            for k, t in enumerate(d["time"]):
+                day = dt.date.fromisoformat(t)
+                days.append({"m": day.month, "d": day.day, "wd": day.weekday(),
+                             "i": wmo_icon(d["weather_code"][k]),
+                             "hi": r1(d["temperature_2m_max"][k]), "lo": r1(d["temperature_2m_min"][k]),
+                             "p": d["precipitation_probability_max"][k] or 0})
+            out.append((x.get("utc_offset_seconds", 0) // 60, days))
+    return out
+
+
+# ── 기상청 ────────────────────────────────────────────
+class Kma:
     def __init__(self):
         self.hub = os.environ.get("KMA_KEY", "").strip()
         self.dgo = os.environ.get("DATA_GO_KR_KEY", "").strip()
+        self.mid_cache = {}
+        self.denied = False
 
-    def fcst(self, path):
+    def items(self, path):
+        if self.denied or not (self.hub or self.dgo):
+            return None
         if self.dgo:
-            return items(get(DATAGO + path, "serviceKey", self.dgo))
-        if self.hub:
-            return items(get(APIHUB + "typ02/openApi/" + path, "authKey", self.hub))
-        return None
+            url, key = DATAGO + path + "&serviceKey=" + self.dgo, None
+        else:
+            url = APIHUB + "typ02/openApi/" + path + "&authKey=" + self.hub
+        name = path.split("?")[0].rsplit("/", 1)[-1]
+        try:
+            r = requests.get(url, timeout=25)
+            r.encoding = "utf-8"
+            if r.status_code != 200:
+                note(f"{name}: HTTP {r.status_code}")
+                if r.status_code == 403:
+                    self.denied = True   # 활용신청 전: 나머지 도시도 같은 결과라 더 부르지 않는다
+                return None
+            res = r.json()["response"]
+            if res["header"]["resultCode"] != "00":
+                note(f"{name}: {res['header']['resultCode']} {res['header'].get('resultMsg', '')}")
+                return None
+            it = res["body"]["items"]["item"]
+            return it if isinstance(it, list) else [it]
+        except Exception as e:
+            note(f"{name}: {e}")
+            return None
+
+    def short(self, nx, ny, now):
+        b = now - dt.timedelta(minutes=15)
+        hs = [h for h in (2, 5, 8, 11, 14, 17, 20, 23) if h <= b.hour]
+        bd, bh = (b.date(), hs[-1]) if hs else ((b - dt.timedelta(days=1)).date(), 23)
+        it = self.items(f"VilageFcstInfoService_2.0/getVilageFcst?pageNo=1&numOfRows=1500&dataType=JSON"
+                        f"&base_date={bd:%Y%m%d}&base_time={bh:02d}00&nx={nx}&ny={ny}")
+        if not it:
+            return {}
+        slots = {}
+        for x in it:
+            t = dt.datetime.strptime(x["fcstDate"] + x["fcstTime"], "%Y%m%d%H%M")
+            slots.setdefault(t, {})[x["category"]] = x["fcstValue"]
+        return slots
+
+    def mid(self, kind, reg, tm):
+        k = (kind, reg)
+        if k not in self.mid_cache:
+            it = self.items(f"MidFcstInfoService/{kind}?pageNo=1&numOfRows=10&dataType=JSON&regId={reg}&tmFc={tm:%Y%m%d%H%M}")
+            self.mid_cache[k] = it[0] if it else None
+        return self.mid_cache[k]
 
 
-# ── 해가 떠 있는지 (밤에는 해 대신 달 아이콘) ───────────────
-def is_day(t):
-    doy = t.timetuple().tm_yday
-    c = math.cos(2 * math.pi * (doy - 172) / 365.0)
-    rise, set_ = 6.4 - 1.2 * c, 18.5 + 1.4 * c
-    h = t.hour + t.minute / 60.0
-    return rise <= h < set_
-
-
-def icon(sky, pty, day):
-    if pty and pty in PTY_ICON:
-        return PTY_ICON[pty]
-    if sky == 1:
-        return "sun" if day else "moon"
-    if sky == 3:
-        return "partly" if day else "partly_night"
-    return "cloud"
+def sky_icon(sky):
+    return {1: "sun", 3: "partly"}.get(sky, "cloud")
 
 
 def text_icon(wf):
@@ -118,160 +212,40 @@ def text_icon(wf):
     return "sun"
 
 
-def num(v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def day_label(d, today):
-    n = (d - today).days
-    return "오늘" if n == 0 else "내일" if n == 1 else WEEK[d.weekday()]
-
-
-# ── 관측 (ASOS, 전 지점 최신 1시간) ─────────────────────────
-def observations(src):
-    if not src.hub:
-        return {}, None
-    t = get(APIHUB + "typ01/url/kma_sfctm2.php?tm=&stn=0&help=0", "authKey", src.hub, enc="euc-kr")
-    if not t:
-        return {}, None
-    header, out, when = None, {}, None
-    for line in t.splitlines():
-        if line.startswith("# YYMM"):
-            header = line[1:].split()
-        elif line and not line.startswith("#") and header:
-            c = line.split()
-            if len(c) < len(header):
-                continue
-            def col(name):
-                v = num(c[header.index(name)])
-                return None if v is None or v <= -9 else v
-            out[int(c[1])] = {"t": col("TA"), "h": col("HM"), "w": col("WS")}
-            when = c[0]
-    return out, when
-
-
-# ── 단기예보 (오늘~글피, 1시간 간격) ────────────────────────
-def short_base(now):
-    b = now - dt.timedelta(minutes=15)
-    hs = [h for h in (2, 5, 8, 11, 14, 17, 20, 23) if h <= b.hour]
-    if not hs:
-        return (b - dt.timedelta(days=1)).date(), 23
-    return b.date(), hs[-1]
-
-
-def short_fcst(src, nx, ny, now):
-    bd, bh = short_base(now)
-    it = src.fcst(f"VilageFcstInfoService_2.0/getVilageFcst?pageNo=1&numOfRows=1500&dataType=JSON"
-                  f"&base_date={bd:%Y%m%d}&base_time={bh:02d}00&nx={nx}&ny={ny}")
-    if not it:
-        return None
-    slots = {}
-    for x in it:
-        t = dt.datetime.strptime(x["fcstDate"] + x["fcstTime"], "%Y%m%d%H%M").replace(tzinfo=KST)
-        slots.setdefault(t, {})[x["category"]] = x["fcstValue"]
-    return dict(sorted(slots.items()))
-
-
-# ── 중기예보 (3~10일 뒤) ─────────────────────────────────
-def mid_tmfc(now):
+def kma_days(kma, c, now):
+    """기상청 값으로 채운 날만 돌려준다 {date: day}"""
+    _, _, _, _, nx, ny, land, ta = c
+    slots = kma.short(nx, ny, now)
     t = now - dt.timedelta(minutes=10)
-    if t.hour >= 18:
-        return dt.datetime(t.year, t.month, t.day, 18, tzinfo=KST)
-    if t.hour >= 6:
-        return dt.datetime(t.year, t.month, t.day, 6, tzinfo=KST)
-    y = t - dt.timedelta(days=1)
-    return dt.datetime(y.year, y.month, y.day, 18, tzinfo=KST)
-
-
-_mid_cache = {}
-
-
-def mid(src, kind, reg, tm):
-    k = (kind, reg)
-    if k not in _mid_cache:
-        it = src.fcst(f"MidFcstInfoService/{kind}?pageNo=1&numOfRows=10&dataType=JSON&regId={reg}&tmFc={tm:%Y%m%d%H%M}")
-        _mid_cache[k] = it[0] if it else None
-    return _mid_cache[k]
-
-
-def city_block(src, c, obs, now, prev):
-    name, nx, ny, land, ta, stn = c
-    today = now.date()
-    slots = short_fcst(src, nx, ny, now)
-    block = {"name": name}
-
-    # 지금
-    o = obs.get(stn, {})
-    cur = None
-    if slots:
-        future = [t for t in slots if t >= now.replace(minute=0, second=0, microsecond=0)]
-        cur = slots[future[0]] if future else None
-    if cur or o.get("t") is not None:
-        sky = int(num((cur or {}).get("SKY")) or 0)
-        pty = int(num((cur or {}).get("PTY")) or 0)
-        t = o.get("t") if o.get("t") is not None else num((cur or {}).get("TMP"))
-        block["now"] = {
-            "t": t,
-            "i": icon(sky, pty, is_day(now)) if cur else "",
-            "s": (PTY_TEXT.get(pty) or SKY_TEXT.get(sky, "")) if cur else "",
-            "h": o.get("h") if o.get("h") is not None else num((cur or {}).get("REH")),
-            "w": o.get("w") if o.get("w") is not None else num((cur or {}).get("WSD")),
-            "p": num((cur or {}).get("POP")),
-        }
-    elif prev and prev.get("now"):
-        block["now"] = prev["now"]
-
-    # 시간별: 지금부터 3시간 간격 8칸
-    if slots:
-        hours = []
-        start = now.replace(minute=0, second=0, microsecond=0)
-        for t, v in slots.items():
-            if t < start or int((t - start).total_seconds()) // 3600 % 3 or len(hours) >= 8:
-                continue
-            hours.append({"l": "지금" if t == start else f"{t.hour}시", "t": num(v.get("TMP")),
-                          "i": icon(int(num(v.get("SKY")) or 0), int(num(v.get("PTY")) or 0), is_day(t)),
-                          "p": num(v.get("POP"))})
-        block["hours"] = hours
-    elif prev and prev.get("hours"):
-        block["hours"] = prev["hours"]   # 받지 못하면 지난번 값
-
-    # 날짜별 7일: 단기예보가 있는 날은 그것으로, 나머지는 중기예보로
-    days = []
-    tm = mid_tmfc(now)
-    for n in range(7):
-        d = today + dt.timedelta(days=n)
-        day = {"l": day_label(d, today), "d": d.day, "wd": d.weekday()}
-        ds = {t: v for t, v in (slots or {}).items() if t.date() == d}
-        if ds and len(ds) >= 6:
+    tm = (dt.datetime(t.year, t.month, t.day, 18) if t.hour >= 18 else
+          dt.datetime(t.year, t.month, t.day, 6) if t.hour >= 6 else
+          dt.datetime(t.year, t.month, t.day, 18) - dt.timedelta(days=1))
+    out = {}
+    for n in range(DAYS):
+        d = now.date() + dt.timedelta(days=n)
+        ds = {k: v for k, v in slots.items() if k.date() == d}
+        day = {"m": d.month, "d": d.day, "wd": d.weekday()}
+        if len(ds) >= 6:
             temps = [num(v.get("TMP")) for v in ds.values() if num(v.get("TMP")) is not None]
             lo = next((num(v["TMN"]) for v in ds.values() if "TMN" in v), None)
             hi = next((num(v["TMX"]) for v in ds.values() if "TMX" in v), None)
             day["lo"] = lo if lo is not None else min(temps)
             day["hi"] = hi if hi is not None else max(temps)
-            pops = [num(v.get("POP")) or 0 for v in ds.values()]
-            day["p"] = max(pops)
-            wet = [int(num(v.get("PTY")) or 0) for t, v in ds.items() if 6 <= t.hour <= 21 and (num(v.get("POP")) or 0) >= 60]
+            day["p"] = max(num(v.get("POP")) or 0 for v in ds.values())
+            wet = [int(num(v.get("PTY")) or 0) for k, v in ds.items() if 6 <= k.hour <= 21 and (num(v.get("POP")) or 0) >= 60]
             wet = [p for p in wet if p]
-            noon = ds.get(dt.datetime(d.year, d.month, d.day, 12, tzinfo=KST)) or list(ds.values())[len(ds) // 2]
-            day["i"] = PTY_ICON[wet[0]] if wet else icon(int(num(noon.get("SKY")) or 0), 0, True)
-        else:
-            k = (d - tm.date()).days
-            l, t = mid(src, "getMidLandFcst", land, tm), mid(src, "getMidTa", ta, tm)
-            if l and t and f"taMin{k}" in t:
-                wf = l.get(f"wf{k}Pm") or l.get(f"wf{k}") or ""
-                day["i"] = text_icon(wf)
-                day["lo"], day["hi"] = num(t.get(f"taMin{k}")), num(t.get(f"taMax{k}"))
-                day["p"] = max(num(l.get(f"rnSt{k}Am")) or 0, num(l.get(f"rnSt{k}Pm")) or 0, num(l.get(f"rnSt{k}")) or 0)
-            elif prev:
-                old = next((x for x in prev.get("days", []) if x.get("d") == d.day and x.get("wd") == d.weekday() and "i" in x), None)
-                if old:
-                    day.update({k2: old[k2] for k2 in ("i", "lo", "hi", "p") if k2 in old})
-        days.append(day)
-    block["days"] = days
-    return block
+            noon = ds.get(dt.datetime(d.year, d.month, d.day, 12)) or list(ds.values())[len(ds) // 2]
+            day["i"] = PTY_ICON.get(wet[0], "rain") if wet else sky_icon(int(num(noon.get("SKY")) or 0))
+            out[d] = day
+            continue
+        k = (d - tm.date()).days
+        lf, tf = kma.mid("getMidLandFcst", land, tm), kma.mid("getMidTa", ta, tm)
+        if lf and tf and f"taMin{k}" in tf:
+            day["i"] = text_icon(lf.get(f"wf{k}Pm") or lf.get(f"wf{k}"))
+            day["lo"], day["hi"] = num(tf.get(f"taMin{k}")), num(tf.get(f"taMax{k}"))
+            day["p"] = max(num(lf.get(f"rnSt{k}Am")) or 0, num(lf.get(f"rnSt{k}Pm")) or 0, num(lf.get(f"rnSt{k}")) or 0)
+            out[d] = day
+    return out
 
 
 def holidays_near(today):
@@ -279,35 +253,41 @@ def holidays_near(today):
         import holidays
     except ImportError:
         return []
-    kr = holidays.KR(years=[today.year, today.year + 1], language="ko")
-    start = today.replace(day=1)
-    end = start + dt.timedelta(days=100)
-    return [{"d": d.isoformat(), "n": n} for d, n in sorted(kr.items()) if start <= d <= end]
-
-
-def load_prev():
-    url = os.environ.get("PREV_URL", "")
-    if not url:
-        return {}
-    try:
-        j = requests.get(url, timeout=20).json()
-        return {c["name"]: c for c in j.get("cities", [])}
-    except Exception:
-        return {}
+    years = [today.year - 1, today.year, today.year + 1]
+    ko = holidays.KR(years=years, language="ko")
+    en = holidays.KR(years=years, language="en_US")
+    start = dt.date(today.year - 1, 12, 1)
+    end = dt.date(today.year + 1, 12, 31)
+    return [{"d": d.isoformat(), "n": n, "e": en.get(d, n)} for d, n in sorted(ko.items()) if start <= d <= end]
 
 
 def main():
-    now = dt.datetime.now(KST)
-    src = Source()
-    if not src.hub and not src.dgo:
-        note("인증키가 없습니다 (KMA_KEY / DATA_GO_KR_KEY)")
-    prev = load_prev()
-    obs, obs_time = observations(src)
-    cities = [city_block(src, c, obs, now, prev.get(c[0])) for c in CITIES]
+    now = dt.datetime.now(KST).replace(tzinfo=None)   # 한국 시각
+    kma = Kma()
+    if not (kma.hub or kma.dgo):
+        note("기상청 인증키가 없습니다 (KMA_KEY / DATA_GO_KR_KEY)")
+    pts = [(c[2], c[3]) for c in KR] + [(c[2], c[3]) for c in WORLD]
+    om = open_meteo(pts)
+    cities = []
+    for i, c in enumerate(KR):
+        tz, days = om[i] if om[i] else (540, [])
+        kd = kma_days(kma, c, now)
+        merged = []
+        for day in days:   # Open-Meteo 날짜 틀에 기상청 값을 덮는다
+            k = dt.date(now.year if day["m"] >= now.month - 1 else now.year + 1, day["m"], day["d"])
+            merged.append(kd.get(k, day))
+        if not days:
+            merged = [kd[k] for k in sorted(kd)]
+        cities.append({"name": c[0], "en": c[1], "lat": c[2], "lon": c[3], "cc": "KR", "tz": tz, "src": "kma" if kd else "om", "days": merged})
+    for i, c in enumerate(WORLD):
+        r = om[len(KR) + i]
+        if not r:
+            continue
+        cities.append({"name": c[0], "en": c[1], "lat": c[2], "lon": c[3], "cc": c[4], "tz": r[0], "days": r[1]})
     out = {
-        "updated": f"{now.month}월 {now.day}일 {now:%H:%M} 기준",
-        "ts": now.isoformat(timespec="minutes"),
-        "obs": obs_time,
+        "ts": now.isoformat(timespec="minutes") + "+09:00",
+        "upd_ko": f"{now.month}월 {now.day}일 {now:%H:%M} 기준",
+        "upd_en": f"Updated {MON_EN[now.month - 1]} {now.day}, {now:%H:%M} KST",
         "cities": cities,
         "holidays": holidays_near(now.date()),
         "log": log[:20],
@@ -315,7 +295,8 @@ def main():
     os.makedirs("site", exist_ok=True)
     with open("site/weather.json", "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"ok: {len(cities)} cities, {len(log)} notes")
+    kma_n = sum(1 for c in cities if c.get("src") == "kma")
+    print(f"ok: {len(cities)} cities (기상청 {kma_n}), {len(log)} notes, {os.path.getsize('site/weather.json')} bytes")
 
 
 if __name__ == "__main__":
