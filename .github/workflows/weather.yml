@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: "1 * * * *"       # 매시 1분 (GitHub 사정으로 몇 분 늦게 돌 수 있음)
   workflow_dispatch:
+  push:                       # 코드를 올리면 바로 한 번 돌려 새 형식으로 배포
+    branches: [main]
+    paths-ignore: [keepalive.txt]
 
 permissions:
   contents: write
