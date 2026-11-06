@@ -1,0 +1,59 @@
+# 1시간마다 기상청 예보를 받아 GitHub Pages 에 weather.json 으로 올린다.
+# 컴퓨터를 켜 둘 필요 없이 GitHub 서버에서 돈다. Actions 탭에서 "Run workflow" 로 바로 돌려 볼 수도 있다.
+name: weather
+
+on:
+  schedule:
+    - cron: "12 * * * *"      # 매시 12분 (UTC 기준이지만 '매시'라 상관없음)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: weather
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests holidays
+
+      - name: 날씨 받기
+        env:
+          KMA_KEY: ${{ secrets.KMA_KEY }}
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          PREV_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/weather.json
+        run: python fetch.py
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # 공개 저장소는 60일 동안 활동이 없으면 예약 실행이 멈춘다. 하루 한 번 날짜만 적어 활동을 남긴다
+      - name: 살아 있음 표시
+        run: |
+          today=$(TZ=Asia/Seoul date +%F)
+          if [ "$(cat keepalive.txt 2>/dev/null)" != "$today" ]; then
+            echo "$today" > keepalive.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt
+            git commit -m "keepalive $today"
+            git push
+          fi
