@@ -7,6 +7,7 @@
 #   DATA_GO_KR_KEY : (선택) 공공데이터포털 일반 인증키. 있으면 기상청 예보를 이쪽에서 받는다
 import datetime as dt
 import json
+import math
 import os
 import sys
 
@@ -35,6 +36,66 @@ KR = [
 ]
 
 # 해외: 이름, 영문, 위도, 경도, 나라 (시간대가 같은 곳은 앞쪽이 시간대만 알 때의 기본값)
+# 국내 시 단위 추가 (이름, 영문, 위도, 경도). 격자 nx/ny 는 위경도에서 계산, 중기 구역은 가장 가까운 위 13곳을 따른다
+KR_EXTRA = [
+    ("고양", "Goyang", 37.658, 126.832), ("용인", "Yongin", 37.241, 127.178), ("성남", "Seongnam", 37.420, 127.127),
+    ("부천", "Bucheon", 37.503, 126.766), ("화성", "Hwaseong", 37.199, 126.831), ("안산", "Ansan", 37.322, 126.831),
+    ("남양주", "Namyangju", 37.636, 127.216), ("안양", "Anyang", 37.394, 126.957), ("평택", "Pyeongtaek", 36.992, 127.113),
+    ("시흥", "Siheung", 37.380, 126.803), ("파주", "Paju", 37.760, 126.780), ("의정부", "Uijeongbu", 37.738, 127.034),
+    ("김포", "Gimpo", 37.615, 126.716), ("경기 광주", "Gwangju (Gyeonggi)", 37.429, 127.255), ("하남", "Hanam", 37.539, 127.215),
+    ("광명", "Gwangmyeong", 37.479, 126.865), ("군포", "Gunpo", 37.362, 126.935), ("오산", "Osan", 37.150, 127.077),
+    ("이천", "Icheon", 37.272, 127.435), ("양주", "Yangju", 37.785, 127.046), ("안성", "Anseong", 37.008, 127.280),
+    ("구리", "Guri", 37.594, 127.130), ("포천", "Pocheon", 37.895, 127.200), ("의왕", "Uiwang", 37.345, 126.968),
+    ("여주", "Yeoju", 37.298, 127.637), ("동두천", "Dongducheon", 37.904, 127.061), ("과천", "Gwacheon", 37.429, 126.988),
+    ("원주", "Wonju", 37.342, 127.920), ("동해", "Donghae", 37.525, 129.114), ("속초", "Sokcho", 38.207, 128.592),
+    ("삼척", "Samcheok", 37.450, 129.165), ("태백", "Taebaek", 37.164, 128.986),
+    ("충주", "Chungju", 36.991, 127.926), ("제천", "Jecheon", 37.133, 128.191),
+    ("천안", "Cheonan", 36.815, 127.114), ("아산", "Asan", 36.790, 127.002), ("서산", "Seosan", 36.785, 126.450),
+    ("당진", "Dangjin", 36.890, 126.628), ("공주", "Gongju", 36.446, 127.119), ("보령", "Boryeong", 36.333, 126.613),
+    ("논산", "Nonsan", 36.187, 127.099), ("계룡", "Gyeryong", 36.274, 127.249), ("세종", "Sejong", 36.480, 127.289),
+    ("군산", "Gunsan", 35.968, 126.737), ("익산", "Iksan", 35.948, 126.958), ("정읍", "Jeongeup", 35.570, 126.856),
+    ("남원", "Namwon", 35.416, 127.390), ("김제", "Gimje", 35.804, 126.880),
+    ("목포", "Mokpo", 34.812, 126.392), ("여수", "Yeosu", 34.760, 127.662), ("순천", "Suncheon", 34.951, 127.487),
+    ("광양", "Gwangyang", 34.940, 127.696), ("나주", "Naju", 35.016, 126.711),
+    ("포항", "Pohang", 36.019, 129.343), ("경주", "Gyeongju", 35.856, 129.225), ("구미", "Gumi", 36.120, 128.344),
+    ("경산", "Gyeongsan", 35.825, 128.741), ("안동", "Andong", 36.568, 128.730), ("김천", "Gimcheon", 36.140, 128.114),
+    ("영주", "Yeongju", 36.806, 128.624), ("상주", "Sangju", 36.411, 128.159), ("영천", "Yeongcheon", 35.973, 128.939),
+    ("문경", "Mungyeong", 36.587, 128.187),
+    ("창원", "Changwon", 35.228, 128.681), ("김해", "Gimhae", 35.229, 128.889), ("진주", "Jinju", 35.180, 128.108),
+    ("양산", "Yangsan", 35.335, 129.037), ("거제", "Geoje", 34.880, 128.621), ("통영", "Tongyeong", 34.854, 128.433),
+    ("사천", "Sacheon", 35.004, 128.064), ("밀양", "Miryang", 35.504, 128.747),
+    ("서귀포", "Seogwipo", 33.254, 126.560),
+]
+
+
+def kma_grid(lat, lon):
+    """위경도 → 기상청 동네예보 격자 (LCC, 기상청 공개 공식)"""
+    RE, GRID, SLAT1, SLAT2, OLON, OLAT, XO, YO = 6371.00877, 5.0, 30.0, 60.0, 126.0, 38.0, 43, 136
+    DEG = math.pi / 180.0
+    re = RE / GRID
+    s1, s2, olon, olat = SLAT1 * DEG, SLAT2 * DEG, OLON * DEG, OLAT * DEG
+    sn = math.log(math.cos(s1) / math.cos(s2)) / math.log(math.tan(math.pi * 0.25 + s2 * 0.5) / math.tan(math.pi * 0.25 + s1 * 0.5))
+    sf = math.tan(math.pi * 0.25 + s1 * 0.5) ** sn * math.cos(s1) / sn
+    ro = re * sf / math.tan(math.pi * 0.25 + olat * 0.5) ** sn
+    ra = re * sf / math.tan(math.pi * 0.25 + lat * DEG * 0.5) ** sn
+    theta = lon * DEG - olon
+    if theta > math.pi: theta -= 2 * math.pi
+    if theta < -math.pi: theta += 2 * math.pi
+    theta *= sn
+    return int(ra * math.sin(theta) + XO + 0.5), int(ro - ra * math.cos(theta) + YO + 0.5)
+
+
+def _extend_kr():
+    base = list(KR)
+    for name, en, lat, lon in KR_EXTRA:
+        nx, ny = kma_grid(lat, lon)
+        near = min(base, key=lambda c: (c[2] - lat) ** 2 + ((c[3] - lon) * math.cos(lat * math.pi / 180)) ** 2)
+        KR.append((name, en, lat, lon, nx, ny, near[6], near[7]))
+    KR.sort(key=lambda c: c[0])   # 가나다순 (날씨판에서 ◀▶ 로 고르기 쉽게)
+
+
+_extend_kr()
+
 WORLD = [
     ("도쿄", "Tokyo", 35.68, 139.69, "JP"), ("오사카", "Osaka", 34.69, 135.50, "JP"),
     ("삿포로", "Sapporo", 43.06, 141.35, "JP"), ("후쿠오카", "Fukuoka", 33.59, 130.40, "JP"),
